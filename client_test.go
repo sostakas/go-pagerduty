@@ -3,10 +3,13 @@ package pagerduty
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -32,7 +35,20 @@ func teardown() {
 	server.Close()
 }
 
+func defaultTestClient(serverURL, authToken string) *Client {
+	return &Client{
+		v2EventsAPIEndpoint: serverURL,
+		apiEndpoint:         serverURL,
+		authToken:           authToken,
+		HTTPClient:          defaultHTTPClient,
+		debugFlag:           new(uint64),
+		lastResponse:        &atomic.Value{},
+	}
+}
+
 func testMethod(t *testing.T, r *http.Request, want string) {
+	t.Helper()
+
 	if got := r.Method; got != want {
 		t.Errorf("Request method: %v, want %v", got, want)
 	}
@@ -328,6 +344,216 @@ func TestAPIError_NotFound(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := tt.a.NotFound(); got != tt.want {
 				t.Fatalf("tt.a.NotFound() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestClient_SetDebugFlag(t *testing.T) {
+	c := defaultTestClient("", "")
+	c.SetDebugFlag(42)
+
+	tests := []struct {
+		name string
+		flag DebugFlag
+	}{
+		{
+			name: "zero_flag",
+		},
+
+		{
+			name: "capture_response_flag",
+			flag: DebugCaptureLastResponse,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c.SetDebugFlag(tt.flag)
+
+			got := atomic.LoadUint64(c.debugFlag)
+			if got != uint64(tt.flag) {
+				t.Fatalf("got = %64b, want = %64b", got, tt.flag)
+			}
+		})
+	}
+}
+
+func TestClient_LastAPIResponse(t *testing.T) {
+	t.Run("unit", func(t *testing.T) {
+		c := defaultTestClient("", "")
+		got, ok := c.LastAPIResponse()
+		if ok {
+			t.Fatal("new client ok = true, want false")
+		}
+
+		if got != nil {
+			t.Fatal("got != nil")
+		}
+
+		tests := []struct {
+			name string
+			resp *http.Response
+			ok   bool
+		}{
+			{
+				name: "nil_response",
+			},
+			{
+				name: "non-nil_response",
+				resp: &http.Response{},
+				ok:   true,
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				c.lastResponse.Store(tt.resp)
+
+				got, ok = c.LastAPIResponse()
+				if ok != tt.ok {
+					t.Fatalf("ok = %t, want %t", ok, tt.ok)
+				}
+
+				if !ok {
+					if got != nil {
+						t.Fatal("got != nil")
+					}
+					return
+				}
+
+				if got != tt.resp {
+					t.Fatalf("got = %v, want %v", got, tt.resp)
+				}
+			})
+		}
+	})
+
+	t.Run("integration", func(t *testing.T) {
+		const responseBody = `{"user": {"id": "1", "email":"foo@bar.com"}}`
+
+		setup()
+		defer teardown()
+
+		mux.HandleFunc("/users/1", func(w http.ResponseWriter, r *http.Request) {
+			testMethod(t, r, http.MethodGet)
+			_, _ = w.Write([]byte(responseBody))
+		})
+
+		c := defaultTestClient(server.URL, "foo")
+		c.SetDebugFlag(DebugCaptureLastResponse)
+
+		_, err := c.GetUser("1", GetUserOptions{})
+		testErrCheck(t, "c.GetUser()", "", err)
+
+		got, ok := c.LastAPIResponse()
+		if !ok {
+			t.Fatal("ok = false, want true")
+		}
+
+		if got == nil {
+			t.Fatal("got == nil")
+		}
+
+		if got.StatusCode != 200 {
+			t.Errorf("got.StatusCode = %d, want 200", got.StatusCode)
+		}
+
+		body, err := ioutil.ReadAll(got.Body)
+		testErrCheck(t, "ioutil.ReadAll()", "", err)
+
+		if jb := string(body); jb != responseBody {
+			t.Fatalf("got.Body = %q, want %q", jb, responseBody)
+		}
+	})
+}
+
+func clientDoHandler(t *testing.T, needsAuth bool) func(w http.ResponseWriter, r *http.Request) {
+	t.Helper()
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		t.Helper()
+		testMethod(t, r, http.MethodPost)
+
+		auth := r.Header.Get("Authorization")
+		if needsAuth && auth != "Token token=foo" {
+			_, _ = w.Write([]byte("badAuth"))
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		if !needsAuth && len(auth) > 0 {
+			_, _ = w.Write([]byte("Authentication header should not be provided"))
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		if accept := r.Header.Get("Accept"); accept != acceptHeader {
+			_, _ = w.Write([]byte(fmt.Sprintf("%q Accept unexpected", accept)))
+			w.WriteHeader(http.StatusNotAcceptable)
+			return
+		}
+
+		if ua := r.Header.Get("User-Agent"); ua != userAgentHeader {
+			_, _ = w.Write([]byte(fmt.Sprintf("%q User-Agent unexpected", ua)))
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		if ct := r.Header.Get("Content-Type"); ct != contentTypeHeader {
+			_, _ = w.Write([]byte(fmt.Sprintf("%q Content-Type unexpected", ct)))
+			w.WriteHeader(http.StatusUnsupportedMediaType)
+			return
+		}
+
+		_, _ = w.Write([]byte("ok"))
+	}
+}
+
+func TestClient_Do(t *testing.T) {
+	c := defaultTestClient(server.URL, "foo")
+
+	tests := []struct {
+		name string
+		auth bool
+	}{
+		{
+			name: "no_auth",
+			auth: false,
+		},
+		{
+			name: "auth",
+			auth: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setup()
+			defer teardown()
+
+			mux.HandleFunc("/test", clientDoHandler(t, tt.auth))
+
+			req, err := http.NewRequest(http.MethodPost, server.URL+"/test", strings.NewReader(`{"empty":"object"}`))
+			testErrCheck(t, "http.NewRequest()", "", err)
+
+			resp, err := c.Do(req, tt.auth)
+			testErrCheck(t, "c.Do()", "", err)
+
+			defer func() {
+				_, _ = io.Copy(ioutil.Discard, resp.Body)
+				_ = resp.Body.Close()
+			}()
+
+			body, err := ioutil.ReadAll(resp.Body)
+			testErrCheck(t, "ioutil.ReadAll()", "", err)
+
+			if resp.StatusCode != 200 {
+				t.Fatalf("request failed with status %q: %s", resp.Status, string(body))
+			}
+
+			if bs := string(body); bs != "ok" {
+				t.Fatalf("body = %s, want ok", bs)
 			}
 		})
 	}
