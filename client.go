@@ -401,6 +401,22 @@ func (c *Client) doWithEndpoint(ctx context.Context, endpoint, method, path stri
 
 	c.prepRequest(req, authRequired, headers)
 
+	fmt.Println("req:")
+	fmt.Printf("req.Method: %s\n", req.Method)
+	fmt.Printf("req.URL: %s\n", req.URL.String())
+	fmt.Printf("req.Header: %#v\n", req.Header)
+
+	data, err := ioutil.ReadAll(req.Body)
+	if err != nil {
+		panic(err.Error())
+	}
+
+	req.Body.Close()
+
+	fmt.Printf("req.Body:\n%s\n", string(data))
+
+	req.Body = ioutil.NopCloser(bytes.NewReader(data))
+
 	resp, err := c.HTTPClient.Do(req)
 
 	// debug mode support

@@ -3,11 +3,13 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/PagerDuty/go-pagerduty"
-	log "github.com/sirupsen/logrus"
-	"github.com/mitchellh/cli"
+	"io/ioutil"
 	"os"
 	"strings"
+
+	"github.com/PagerDuty/go-pagerduty"
+	"github.com/mitchellh/cli"
+	log "github.com/sirupsen/logrus"
 )
 
 type ScheduleOverrideCreate struct {
@@ -41,6 +43,7 @@ func (c *ScheduleOverrideCreate) Run(args []string) int {
 		return -1
 	}
 	client := c.Meta.Client()
+	client.SetDebugFlag(pagerduty.DebugCaptureLastResponse)
 	var o pagerduty.Override
 	if len(flags.Args()) != 2 {
 		log.Error("Please specify input json file")
@@ -48,7 +51,7 @@ func (c *ScheduleOverrideCreate) Run(args []string) int {
 	}
 	log.Info("service id is:", flags.Arg(0))
 	log.Info("Input file is:", flags.Arg(1))
-	f, err := os.Open(flags.Arg(0))
+	f, err := os.Open(flags.Arg(1))
 	if err != nil {
 		log.Error(err)
 		return -1
@@ -62,7 +65,23 @@ func (c *ScheduleOverrideCreate) Run(args []string) int {
 	log.Debugf("%#v", o)
 	o1, err := client.CreateOverride(flags.Arg(0), o)
 	if err != nil {
-		log.Error(err)
+		// log.Error(err)
+
+		fmt.Printf("\n\nerr: %s\n\n", err)
+
+		resp, ok := client.LastAPIResponse()
+		if ok {
+			fmt.Println("resp:")
+			fmt.Printf("resp.Status: %s\n", resp.Status)
+			fmt.Printf("resp.Header: %#v\n", resp.Header)
+
+			body, err := ioutil.ReadAll(resp.Body)
+			if err != nil {
+				panic(err.Error())
+			}
+
+			fmt.Printf("resp.Body:\n%s\n", string(body))
+		}
 		return -1
 	}
 	log.Println("New override id:", o1.ID)
