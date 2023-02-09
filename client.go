@@ -594,9 +594,18 @@ func (c *Client) getErrorFromResponse(resp *http.Response) APIError {
 	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
 		defer resp.Body.Close()
 
+		var extraData string
+
+		respBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			extraData = fmt.Sprintf(", and failed reading response body: %v", err)
+		} else {
+			extraData = fmt.Sprintf(", and got response body: %s", string(respBody))
+		}
+
 		aerr := APIError{
 			StatusCode: resp.StatusCode,
-			message:    fmt.Sprintf("HTTP response with status code %d does not contain Content-Type: application/json", resp.StatusCode),
+			message:    fmt.Sprintf("HTTP response with status code %d does not contain Content-Type: application/json%s", resp.StatusCode, extraData),
 		}
 
 		return aerr
